@@ -125,6 +125,53 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
 
+        # H3: after the last task, dump features of every adapter for offline router benchmarks.
+        if self.args.get("dump_dir") and self._cur_task == data_manager.nb_tasks - 1:
+            self.dump_features(data_manager, self.args["dump_dir"])
+
+    @torch.no_grad()
+    def _feats(self, loader, adapter_ids):
+        bb = self._network.backbone
+        bb.eval()
+        out = {a: [] for a in adapter_ids}
+        ys = []
+        for _, inputs, targets in loader:
+            inputs = inputs.to(self._device)
+            for a in adapter_ids:
+                out[a].append(bb(inputs, adapter_id=a, train=False)["features"].half().cpu())
+            ys.append(targets)
+        return {a: torch.cat(v) for a, v in out.items()}, torch.cat(ys)
+
+    @torch.no_grad()
+    def dump_features(self, data_manager, dump_dir):
+        import os
+        os.makedirs(dump_dir, exist_ok=True)
+        T = self._cur_task + 1
+        C = self._total_classes
+        test = data_manager.get_dataset(np.arange(0, C), source="test", mode="test")
+        loader = DataLoader(test, batch_size=128, shuffle=False, num_workers=num_workers)
+        # -1 = frozen backbone, 0..T-1 = task adapters, T = adapter TUNA's eval uses as the general one
+        # (adapter_id == len(adapter_list) -> cur_adapter = last task's adapter), T+1 = the EMR-merged adapter
+        te, yte = self._feats(loader, [-1] + list(range(T)) + [T, T + 1])
+        # train set without augmentation: frozen space + the own task's adapter only (memories)
+        tr_frozen, tr_own, ytr = [], [], []
+        for t in range(T):
+            cls = [c for c in range(C) if self.cls2task[c] == t]
+            ds = data_manager.get_dataset(np.array(cls), source="train", mode="test")
+            f, y = self._feats(DataLoader(ds, batch_size=128, shuffle=False, num_workers=num_workers), [-1, t])
+            tr_frozen.append(f[-1]); tr_own.append(f[t]); ytr.append(y)
+        fc = self._network.fc
+        logits = {a: torch.cat([fc(x.float().to(self._device))["logits"][:, :C].cpu() for x in v.split(1024)])
+                  for a, v in te.items()}
+        torch.save({
+            "test_feats": te, "test_logits": logits, "test_labels": yte,
+            "train_frozen": torch.cat(tr_frozen), "train_own": torch.cat(tr_own), "train_labels": torch.cat(ytr),
+            "cls2task": torch.tensor([self.cls2task[c] for c in range(C)]),
+            "fc": {k: v.cpu() for k, v in self._network.fc.state_dict().items()},
+            "scale": self.args["scale"], "class_order": list(data_manager._class_order),
+        }, os.path.join(dump_dir, f"feats_seed{self.args['seed']}.pt"))
+        logging.info(f"H3 dump written to {dump_dir}")
+
     def _train(self, train_loader, test_loader):
         self._network.backbone.to(self._device)
         self._network.fc.to(self._device)

@@ -8,7 +8,7 @@
     "init_cls": 10,
     "increment": 10,
     "model_name": "lae",
-    "backbone_type": "vit_base_patch16_224_lae",
+    "backbone_type": "vit_base_patch16_224",
     "device": ["0"],
     "seed": [1993],
     "tuned_epoch": 5,
